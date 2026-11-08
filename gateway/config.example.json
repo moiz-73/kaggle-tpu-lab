@@ -17,6 +17,7 @@
   "mtp": 3,
   "reasoningEffort": "low",
   "allowAnthropic": true,
+  "disableThinking": true,
   "assumedTokPerSecSingle": 130,
   "assumedTokPerSecAggregate": 540
 }

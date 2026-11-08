@@ -49,9 +49,12 @@ const DEFAULTS = {
   mtp: 3,
   reasoningEffort: "low",
   allowAnthropic: true,             // also proxy /v1/messages
+  disableThinking: true,            // inject enable_thinking=false (llama.cpp/Qwen)
   // planning figures used only for the "compute secured" report
   assumedTokPerSecSingle: 130,
   assumedTokPerSecAggregate: 540,
+  assumedGpuTokPerSecSingle: 13.7,
+  assumedGpuTokPerSecAggregate: 25,
 };
 
 function readJson(p, fallback) {
@@ -81,6 +84,11 @@ function bool(v) { return ["1", "true", "yes", "on"].includes(String(v).toLowerC
 const ACCOUNTS_P = process.env.KTL_ACCOUNTS || path.join(HERE, "accounts.local.json");
 const STATE_P = process.env.KTL_STATE || path.join(HERE, "state.local.json");
 const WORK_P = path.join(HERE, ".work");
+
+// The recipe decides which accelerator and which quota the gateway spends.
+const IS_GPU = /-gpu$/.test(cfg.model);
+const KIND = IS_GPU ? "gpu" : "tpu";
+const ELIGIBLE = IS_GPU ? "gpuEligible" : "tpuEligible";
 
 // ---------------------------------------------------------------- state -----
 function loadState() {
@@ -127,6 +135,7 @@ function accountsView() {
   return loadAccounts().map((a) => ({
     name: a.name, username: a.username,
     tpuEligible: a.tpuEligible !== false && accountState.get(a.name)?.tpuEligible !== false,
+    gpuEligible: a.gpuEligible !== false && accountState.get(a.name)?.gpuEligible !== false,
     lastBootAt: accountState.get(a.name)?.lastBootAt || null,
     lastError: accountState.get(a.name)?.lastError || null,
   }));
@@ -172,9 +181,9 @@ async function kernelStatus(account, kernel) {
 
 // ------------------------------------------------------------------ boot ----
 class BootError extends Error {
-  constructor(message, { step = null, account = null, noTpu = false } = {}) {
+  constructor(message, { step = null, account = null, noAccel = false } = {}) {
     super(message);
-    this.step = step; this.account = account; this.noTpu = noTpu;
+    this.step = step; this.account = account; this.noAccel = noAccel;
   }
 }
 
@@ -260,9 +269,9 @@ async function waitForReady(account, st, onPhase) {
         return { ...st, ...ev, events };
       }
       if (ev.phase === "failed") {
-        const noTpu = ev.step === "no-tpu";
+        const noAccel = ev.step === "no-tpu" || ev.step === "no-gpu";
         throw new BootError(`kernel failed at ${ev.step || "?"}: ${ev.cause || ev.hint || "see kernel log"}`,
-          { step: ev.step, account: account.name, noTpu });
+          { step: ev.step, account: account.name, noAccel });
       }
       if (ev.phase === "stopped" && (ev.cause || ev.hint)) {
         throw new BootError(`server exited: ${ev.cause || ev.hint}`, { account: account.name });
@@ -284,22 +293,23 @@ async function waitForReady(account, st, onPhase) {
 async function pickAccount(exclude = new Set()) {
   const accounts = loadAccounts().filter((a) =>
     !exclude.has(a.name) &&
-    a.tpuEligible !== false &&
-    accountState.get(a.name)?.tpuEligible !== false);
-  if (!accounts.length) throw new BootError("no account marked TPU-eligible", { step: "no-account" });
+    a[ELIGIBLE] !== false &&
+    accountState.get(a.name)?.[ELIGIBLE] !== false);
+  if (!accounts.length) throw new BootError(`no account marked ${KIND.toUpperCase()}-eligible`, { step: "no-account" });
 
   const rows = [];
   for (const a of accounts) {
     try {
       const q = await kaggleQuota(a);
-      const tpuLeft = secs(q.tpuQuota?.totalTimeAllowed) - secs(q.tpuQuota?.timeUsed) - secs(q.tpuQuota?.timeReserved);
-      rows.push({ a, tpuLeft, q });
+      const bucket = IS_GPU ? q.gpuQuota : q.tpuQuota;
+      const left = secs(bucket?.totalTimeAllowed) - secs(bucket?.timeUsed) - secs(bucket?.timeReserved);
+      rows.push({ a, left, q });
     } catch (e) {
       setAccountState(a.name, { lastError: `quota: ${e.message}` });
     }
   }
-  const usable = rows.filter((r) => r.tpuLeft > 600).sort((x, y) => y.tpuLeft - x.tpuLeft);
-  if (!usable.length) throw new BootError("every account is out of TPU quota this week", { step: "quota" });
+  const usable = rows.filter((r) => r.left > 600).sort((x, y) => y.left - x.left);
+  if (!usable.length) throw new BootError(`every account is out of ${KIND.toUpperCase()} quota this week`, { step: "quota" });
   return usable[0];
 }
 
@@ -309,9 +319,9 @@ async function boot() {
   log("cold start requested");
   const tried = [];
   for (let attempt = 0; attempt < loadAccounts().length; attempt++) {
-    const { a: account, tpuLeft } = await pickAccount(new Set(tried));
+    const { a: account, left } = await pickAccount(new Set(tried));
     tried.push(account.name);
-    log(`using account ${account.name} (${hours(tpuLeft)} TPU-h left this week)`);
+    log(`using account ${account.name} (${hours(left)} ${KIND.toUpperCase()}-h left this week)`);
 
     let pushed = null;
     try {
@@ -346,7 +356,7 @@ async function boot() {
       log(`live at ${state.backend.endpoint} (startup ${ready.startup_secs ?? "?"} s)`);
       return state.backend;
     } catch (e) {
-      setAccountState(account.name, { lastError: e.message, ...(e.noTpu ? { tpuEligible: false } : {}) });
+      setAccountState(account.name, { lastError: e.message, ...(e.noAccel ? { [ELIGIBLE]: false } : {}) });
       if (e.noTpu) log(`account ${account.name} has no TPU — marked ineligible`);
       try { await kaggleCli(account, ["kernels", "delete", pushed?.kernel || `${account.username}/${cfg.slug}`], { input: "yes\n", timeoutMs: 120000 }); } catch {}
       state.backend = null;
@@ -621,13 +631,16 @@ const server = http.createServer(async (req, res) => {
             gpu: { allowedH: hours(gpuAllowed), usedH: hours(gpuUsed), remainingH: hours(gpuAllowed - gpuUsed) },
           };
           row.tpuAvailable = tpuAllowed - tpuUsed > 600;
+          row.gpuAvailable = gpuAllowed - gpuUsed > 600;
         } catch (e) { row.quotaError = e.message; }
         accounts.push(row);
       }
       const securedTpuH = accounts.reduce((s, a) => s + (a.quota?.tpu.allowedH || 0), 0);
       const securedGpuH = accounts.reduce((s, a) => s + (a.quota?.gpu.allowedH || 0), 0);
       const remainingTpuH = accounts.reduce((s, a) => s + (a.quota?.tpu.remainingH || 0), 0);
+      const remainingGpuH = accounts.reduce((s, a) => s + (a.quota?.gpu.remainingH || 0), 0);
       const usableTpuH = accounts.reduce((s, a) => s + (a.tpuEligible && a.tpuAvailable ? (a.quota?.tpu.remainingH || 0) : 0), 0);
+      const usableGpuH = accounts.reduce((s, a) => s + (a.gpuEligible && a.gpuAvailable ? (a.quota?.gpu.remainingH || 0) : 0), 0);
       const weekAgo = Date.now() - 7 * 24 * 3600e3;
       const delivered = state.ledger.filter((e) => Date.parse(e.endedAt || 0) > weekAgo);
       return sendJson(res, 200, {
@@ -643,19 +656,26 @@ const server = http.createServer(async (req, res) => {
         compute: {
           accounts: accounts.length,
           tpuEligibleAccounts: accounts.filter((a) => a.tpuEligible).length,
+          gpuEligibleAccounts: accounts.filter((a) => a.gpuEligible).length,
+          recipe: cfg.model,
+          accelerator: KIND,
           // nominal: every account's weekly allowance, including accounts Kaggle
-          // has not TPU-verified yet (their quota exists but cannot be claimed)
+          // has not verified yet (their quota exists but cannot be claimed)
           securedGpuHoursPerWeek: Math.round(securedGpuH * 100) / 100,
           securedTpuHoursPerWeek: Math.round(securedTpuH * 100) / 100,
-          // usable right now through TPU-verified accounts
+          // usable right now through eligible accounts
           usableTpuHours: Math.round(usableTpuH * 100) / 100,
+          usableGpuHours: Math.round(usableGpuH * 100) / 100,
           lockedTpuHours: Math.round((remainingTpuH - usableTpuH) * 100) / 100,
+          lockedGpuHours: Math.round((remainingGpuH - usableGpuH) * 100) / 100,
           usableTpuChipHours: Math.round(usableTpuH * 8 * 100) / 100,
           tpuChipHoursPerWeek: Math.round(securedTpuH * 8 * 100) / 100,
           remainingTpuHours: Math.round(remainingTpuH * 100) / 100,
-          // what the usable TPU hours can carry at the measured speeds
-          estimatedTokensPerWeekSingleStream: Math.round(usableTpuH * 3600 * cfg.assumedTokPerSecSingle),
-          estimatedTokensPerWeekAggregate: Math.round(usableTpuH * 3600 * cfg.assumedTokPerSecAggregate),
+          // what the usable hours can carry at the recipe's measured speed
+          estimatedTokensPerWeekSingleStream: Math.round((IS_GPU ? usableGpuH : usableTpuH) * 3600
+            * (IS_GPU ? cfg.assumedGpuTokPerSecSingle : cfg.assumedTokPerSecSingle)),
+          estimatedTokensPerWeekAggregate: Math.round((IS_GPU ? usableGpuH : usableTpuH) * 3600
+            * (IS_GPU ? cfg.assumedGpuTokPerSecAggregate : cfg.assumedTokPerSecAggregate)),
         },
         ledger: {
           sessionsLast7d: delivered.length,
@@ -670,6 +690,7 @@ const server = http.createServer(async (req, res) => {
       const raw = await readBody(req);
       let body; try { body = JSON.parse(raw.toString()); } catch { return openAiError(res, 400, "invalid JSON", "invalid_request_error"); }
       if (cfg.forceModel) body.model = cfg.servedModel;
+      if (cfg.disableThinking) body.chat_template_kwargs = { enable_thinking: false, ...(body.chat_template_kwargs || {}) };
       state.counters.requests++;
       const stream = body.stream === true;
       if (stream) {

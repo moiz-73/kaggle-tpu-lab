@@ -36,9 +36,18 @@ ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared +
 GLM_DATASETS = ["rahim3/glm53-flash-iq3xxs-1", "rahim3/glm53-flash-iq3xxs-2",
                 "rahim3/glm53-flash-fp8-1", "rahim3/glm53-flash-fp8-2", "rahim3/glm53-flash-fp8-3", "rahim3/glm53-flash-fp8-4"]
 
+# Prebuilt llama-server binaries for Tesla T4 (sm_75, CUDA 12.x). Attached as
+# datasets so a GPU session never depends on GitHub's flaky release edge.
+GPU_RUNTIME_DATASETS = ["alessandrogemignani/llama-server-t4-cuda",
+                        "nixty2/llama-cpp-turing-sm75",
+                        "rahim3/qwen38-tpu-env-v5e8"]  # also carries a cloudflared binary
+
 # One entry per model folder: the kernel script, the default kernel name, and (for our own engine) the package to embed.
 MODELS = {
     "qwen38-27b": {"kernel": KERNEL_SRC, "slug": "qwen38-tpu-serve", "model_name": "qwen3.8-27b", "minutes": 22},
+    "qwen38-27b-gpu": {"kernel": HERE / "qwen38-gpu" / "kernel" / "serve_qwen38_gpu.py",
+                       "slug": "qwen38-gpu-serve", "model_name": "qwen3.8-27b", "minutes": 9,
+                       "accelerator": "NvidiaTeslaT4", "gpu": True},
     "glm53-flash": {"kernel": HERE / "glm53-flash" / "kernel" / "serve_glm53.py", "slug": "glm53-tpu-serve",
                     "model_name": "glm-5.3-flash", "engine": HERE / "glm53-flash" / "engine" / "glm53", "minutes": 25},
 }
@@ -150,6 +159,20 @@ def prepare(args):
         if args.no_async_scheduling:
             cfg["async_scheduling"] = False
         datasets = [args.weights_dataset, ENV_DATASET]
+    elif args.model == "qwen38-27b-gpu":
+        # 2x Tesla T4, llama.cpp + GGUF: no TPU datasets, weights come from HF
+        cfg = {
+            "ntfy_topic": topic,
+            "api_key": api_key,
+            "ctx": min(args.max_model_len, 32768),
+            "parallel": 2,
+            "keepalive_min": args.keepalive_min,
+            "model_file": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+            "model_bytes": 16464440224,
+        }
+        if args.verbose:
+            cfg["verbose"] = True
+        datasets = GPU_RUNTIME_DATASETS
     else:
         cfg = {
             "ntfy_topic": topic,
@@ -180,6 +203,7 @@ def prepare(args):
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         (td / model["kernel"].name).write_text(src)
+        is_gpu = bool(model.get("gpu"))
         (td / "kernel-metadata.json").write_text(json.dumps({
             "id": f"{user}/{slug}",
             "title": slug,
@@ -187,14 +211,14 @@ def prepare(args):
             "language": "python",
             "kernel_type": "script",
             "is_private": "true",
-            "enable_gpu": "false",
-            "enable_tpu": "true",
-            "machine_shape": "TpuV5E8",
+            "enable_gpu": "true" if is_gpu else "false",
+            "enable_tpu": "false" if is_gpu else "true",
+            "machine_shape": model.get("accelerator", "TpuV5E8"),
             "enable_internet": "true",
             "dataset_sources": datasets,
             "competition_sources": [], "kernel_sources": [], "model_sources": [],
         }, indent=1))
-        say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
+        say(f"Pushing kernel {user}/{slug} ({'GPU T4 x2' if is_gpu else 'TPU v5e-8'})...")
         r = kaggle("kernels", "push", "-p", str(td))
         out = (r.stdout or "") + (r.stderr or "")
         if "successfully pushed" not in out:
