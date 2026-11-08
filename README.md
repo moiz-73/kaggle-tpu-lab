@@ -38,6 +38,13 @@ ANTHROPIC_BASE_URL=<url> ANTHROPIC_AUTH_TOKEN=<key> ANTHROPIC_MODEL=<model> clau
 
 Each folder README has the exact lines for Claude Code, Codex CLI and opencode.
 
+## GPU fallback
+
+For accounts Kaggle has verified for GPU but not TPU, [`qwen38-gpu/`](qwen38-gpu/)
+serves the same Qwen3.8-27B as a 4-bit GGUF on 2× Tesla T4 with llama.cpp:
+13.5–13.7 tok/s single stream, first token 3.3 s, endpoint ~7 min after start,
+32k context. Measurements and limits are in that folder.
+
 ## From a terminal
 
 ```bash

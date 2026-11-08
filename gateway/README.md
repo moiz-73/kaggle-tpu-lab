@@ -31,6 +31,20 @@ is spent on tokens, not on uptime.
 * **Anthropic passthrough** (`/v1/messages`) so Claude Code can use the same
   endpoint (`ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`).
 
+## Recipes
+
+`model` in `config.local.json` picks the accelerator and the quota the gateway
+spends:
+
+| `model` | Accelerator | Quota | Account flag |
+|---|---|---|---|
+| `qwen38-27b` | TPU v5e-8 | 20 h/week | `tpuEligible` |
+| `qwen38-27b-gpu` | 2× Tesla T4 (llama.cpp GGUF) | 30 h/week | `gpuEligible` |
+
+Both exposed as `qwen3.8-27b`. The GPU recipe is ~10× slower per stream but
+works on accounts that are GPU-verified and not TPU-verified; see
+[`../qwen38-gpu/`](../qwen38-gpu/).
+
 ## Setup
 
 ```bash
