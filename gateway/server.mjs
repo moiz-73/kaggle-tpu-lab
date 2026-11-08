@@ -679,7 +679,7 @@ const server = http.createServer(async (req, res) => {
         },
         ledger: {
           sessionsLast7d: delivered.length,
-          billableTpuSecondsLast7d: delivered.reduce((s, e) => s + (e.billableSeconds || 0), 0),
+          billableAcceleratorSecondsLast7d: delivered.reduce((s, e) => s + (e.billableSeconds || 0), 0),
           servingSecondsLast7d: delivered.reduce((s, e) => s + (e.servingSeconds || 0), 0),
           recent: state.ledger.slice(-10),
         },
